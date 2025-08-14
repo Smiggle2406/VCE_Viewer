@@ -246,7 +246,7 @@ class VCAASubjectScraperThread(QThread):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
             resp = requests.get(
-                VCAA_SUBJECTS_PAGE, headers=headers, timeout=30, verify=False
+                VCAA_SUBJECTS_PAGE, headers=headers, timeout=30
             )
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -301,7 +301,7 @@ class VCAADownloadThread(QThread):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
             resp = requests.get(
-                self.subject_url, headers=headers, timeout=30, verify=False
+                self.subject_url, headers=headers, timeout=30
             )
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -334,7 +334,7 @@ class VCAADownloadThread(QThread):
                 filename = file_url.split("/")[-1]
                 try:
                     r = requests.get(
-                        file_url, headers=headers, timeout=120, verify=False
+                        file_url, headers=headers, timeout=120
                     )
                     r.raise_for_status()
 
