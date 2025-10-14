@@ -255,7 +255,16 @@ class VCAASubjectScraperThread(QThread):
 
     @staticmethod
     def _normalise_subject_key(label: str) -> str:
-        return re.sub(r"\s+", " ", label.strip()).lower()
+        cleaned = re.sub(r"\(.*?nht.*?\)", "", label, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"northern\s+hemisphere\s+timetable",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\bnht\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned.lower()
 
     @staticmethod
     def _scrape_subject_page(page_url: str, headers: dict):
@@ -342,7 +351,7 @@ class VCAADownloadThread(QThread):
         t = (link_text or "").lower()
         if any(k in h or k in t for k in EXCLUDE_HINTS):
             return True
-        if REPORT_TOKEN not in t:
+        if REPORT_TOKEN not in t and REPORT_TOKEN not in h:
             return True
         if not (h.endswith(".pdf") or h.endswith(".docx") or h.endswith(".doc")):
             return True
