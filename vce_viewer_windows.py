@@ -10,6 +10,7 @@ import threading
 
 import shutil as _shutil
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint
@@ -75,6 +76,8 @@ VCAA_NHT_SUBJECTS_PAGE = (
 VCAA_SUBJECTS_PREFIX = (
     "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
 )
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Always skip these (case-insensitive)
 EXCLUDE_HINTS = [
@@ -252,14 +255,16 @@ class DocxConverterThread(QThread):
 
 # ------------------ VCAA SCRAPER ------------------
 class VCAASubjectScraperThread(QThread):
-    finished = pyqtSignal(dict)  # {subject_name: url}
+    finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
     @staticmethod
-    def _scrape_subject_page(
-        page_url: str, headers: dict, label_suffix: str = "", verify: bool = True
-    ):
-        resp = requests.get(page_url, headers=headers, timeout=30, verify=verify)
+    def _normalise_subject_key(label: str) -> str:
+        return re.sub(r"\s+", " ", label.strip()).lower()
+
+    @staticmethod
+    def _scrape_subject_page(page_url: str, headers: dict):
+        resp = requests.get(page_url, headers=headers, timeout=30, verify=False)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         subjects = {}
@@ -282,22 +287,42 @@ class VCAASubjectScraperThread(QThread):
                 VCAA_NHT_SUBJECTS_PAGE.rstrip("/"),
             }:
                 continue
-            subjects[f"{text}{label_suffix}"] = full
+            key = VCAASubjectScraperThread._normalise_subject_key(text)
+            subjects.setdefault(
+                key,
+                {
+                    "label": text,
+                    "urls": [],
+                },
+            )
+            subjects[key]["urls"].append(full)
         return subjects
 
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            subjects = self._scrape_subject_page(
-                VCAA_SUBJECTS_PAGE, headers, verify=False
-            )
+            subjects = self._scrape_subject_page(VCAA_SUBJECTS_PAGE, headers)
             try:
-                nht_subjects = self._scrape_subject_page(
-                    VCAA_NHT_SUBJECTS_PAGE, headers, " (NHT)", verify=False
-                )
+                nht_subjects = self._scrape_subject_page(VCAA_NHT_SUBJECTS_PAGE, headers)
             except Exception:
                 nht_subjects = {}
-            subjects.update(nht_subjects)
+
+            for key, info in nht_subjects.items():
+                if key in subjects:
+                    subjects[key]["urls"].extend(info["urls"])
+                else:
+                    subjects[key] = info
+
+            for info in subjects.values():
+                seen_urls = set()
+                unique_urls = []
+                for url in info["urls"]:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    unique_urls.append(url)
+                info["urls"] = unique_urls
+
             if not subjects:
                 self.error.emit("No subjects found on the VCAA index page.")
             else:
@@ -314,10 +339,12 @@ class VCAADownloadThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, subject_name, subject_url):
+    def __init__(self, subject_name, subject_urls):
         super().__init__()
         self.subject_name = subject_name
-        self.subject_url = subject_url
+        self.subject_urls = (
+            subject_urls if isinstance(subject_urls, (list, tuple)) else [subject_urls]
+        )
 
     @staticmethod
     def _should_skip(link_href: str, link_text: str) -> bool:
@@ -336,23 +363,33 @@ class VCAADownloadThread(QThread):
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(
-                self.subject_url, headers=headers, timeout=30, verify=False
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
             links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                text = a.get_text(strip=True)
-                if not href:
-                    continue
-                if self._should_skip(href, text):
-                    continue
-                links.append(urljoin(VCAA_BASE, href))
 
-            total = len(links)
+            for page_url in self.subject_urls:
+                resp = requests.get(
+                    page_url, headers=headers, timeout=30, verify=False
+                )
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    text = a.get_text(strip=True)
+                    if not href:
+                        continue
+                    if self._should_skip(href, text):
+                        continue
+                    links.append(urljoin(VCAA_BASE, href))
+
+            seen = set()
+            unique_links = []
+            for link in links:
+                if link in seen:
+                    continue
+                seen.add(link)
+                unique_links.append(link)
+
+            total = len(unique_links)
             if total == 0:
                 self.finished.emit(
                     f"No examination reports found for {self.subject_name}."
@@ -412,7 +449,7 @@ class VCAADownloadThread(QThread):
             self.progress.emit("Starting concurrent downloads...", 0, total)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(download_one, url) for url in links]
+                futures = [executor.submit(download_one, url) for url in unique_links]
                 concurrent.futures.wait(futures)
 
             self.finished.emit(f"All reports for {self.subject_name} downloaded.")
@@ -1005,9 +1042,10 @@ class VCEViewer(QMainWindow):
         # Load subjects asynchronously
         def on_subjects_loaded(subjects: dict):
             combo.clear()
-            for s in sorted(subjects.keys()):
-                combo.addItem(s, subjects[s])
-            progress_label.setText(f"Loaded {len(subjects)} subjects from VCAA")
+            sorted_subjects = sorted(subjects.values(), key=lambda v: v["label"].lower())
+            for info in sorted_subjects:
+                combo.addItem(info["label"], info["urls"])
+            progress_label.setText(f"Loaded {len(sorted_subjects)} subjects from VCAA")
 
         def on_subject_error(msg):
             QMessageBox.warning(dialog, "Error", msg)
@@ -1020,11 +1058,11 @@ class VCEViewer(QMainWindow):
 
         def download_selected():
             subject_name = combo.currentText()
-            subject_url = combo.currentData()
-            if not subject_url:
-                QMessageBox.warning(dialog, "Error", "No subject URL found.")
+            subject_urls = combo.currentData()
+            if not subject_urls:
+                QMessageBox.warning(dialog, "Error", "No subject URLs found.")
                 return
-            download_thread = VCAADownloadThread(subject_name, subject_url)
+            download_thread = VCAADownloadThread(subject_name, subject_urls)
 
             def update_progress(msg, current, total):
                 progress_bar.setMaximum(total)
