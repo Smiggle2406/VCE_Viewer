@@ -63,9 +63,17 @@ WORD_EXTENSIONS = {".doc", ".docx"}
 
 VCAA_BASE = "https://www.vcaa.vic.edu.au"
 VCAA_SUBJECTS_PAGE = (
-        VCAA_BASE
-        + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
-        + "examination-specifications-past-examinations-and-external-assessment-reports"
+    VCAA_BASE
+    + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
+    + "examination-specifications-past-examinations-and-external-assessment-reports"
+)
+VCAA_NHT_SUBJECTS_PAGE = (
+    VCAA_BASE
+    + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
+    + "nht-examination-specifications-past-examinations-and-examination-reports"
+)
+VCAA_SUBJECTS_PREFIX = (
+    "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
 )
 
 # Always skip these (case-insensitive)
@@ -247,31 +255,49 @@ class VCAASubjectScraperThread(QThread):
     finished = pyqtSignal(dict)  # {subject_name: url}
     error = pyqtSignal(str)
 
+    @staticmethod
+    def _scrape_subject_page(
+        page_url: str, headers: dict, label_suffix: str = "", verify: bool = True
+    ):
+        resp = requests.get(page_url, headers=headers, timeout=30, verify=verify)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        subjects = {}
+        for link in soup.find_all("a", href=True):
+            text = link.get_text(strip=True)
+            href = link["href"].strip()
+            if not href or not text:
+                continue
+            full = urljoin(VCAA_BASE, href)
+            path_lower = full.lower()
+            # Keep only VCE study pages under this subtree, skip VET and other hubs
+            if "/vce-vet-" in path_lower:
+                continue
+            if VCAA_SUBJECTS_PREFIX not in path_lower:
+                continue
+            full_stripped = full.rstrip("/")
+            if full_stripped in {
+                page_url.rstrip("/"),
+                VCAA_SUBJECTS_PAGE.rstrip("/"),
+                VCAA_NHT_SUBJECTS_PAGE.rstrip("/"),
+            }:
+                continue
+            subjects[f"{text}{label_suffix}"] = full
+        return subjects
+
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(
-                VCAA_SUBJECTS_PAGE, headers=headers, timeout=30, verify=False
+            subjects = self._scrape_subject_page(
+                VCAA_SUBJECTS_PAGE, headers, verify=False
             )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            subjects = {}
-            for link in soup.find_all("a", href=True):
-                text = link.get_text(strip=True)
-                href = link["href"].strip()
-                if not href:
-                    continue
-                full = urljoin(VCAA_BASE, href)
-                path_lower = full.lower()
-                # Keep only VCE study pages under this subtree, skip VET and NHT index hub pages
-                if "/vce-vet-" in path_lower:
-                    continue
-                if (
-                        "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
-                        in path_lower
-                ):
-                    if full.rstrip("/") != VCAA_SUBJECTS_PAGE.rstrip("/") and text:
-                        subjects[text] = full
+            try:
+                nht_subjects = self._scrape_subject_page(
+                    VCAA_NHT_SUBJECTS_PAGE, headers, " (NHT)", verify=False
+                )
+            except Exception:
+                nht_subjects = {}
+            subjects.update(nht_subjects)
             if not subjects:
                 self.error.emit("No subjects found on the VCAA index page.")
             else:
