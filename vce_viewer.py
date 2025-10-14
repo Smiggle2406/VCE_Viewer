@@ -5,7 +5,7 @@ import subprocess
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 import concurrent.futures
 import threading
 
@@ -103,6 +103,29 @@ SUBJECT_ALIASES = {
     "sm": "SpecialistMaths",
     "chemistry": "Chemistry",
     "chem": "Chemistry",
+}
+
+SUBJECT_KEY_ALIASES = {
+    "mathmethodscas": "mathmethodscas",
+    "mathematicalmethods": "mathmethods",
+    "mathmethods": "mathmethods",
+    "mmcas": "mathmethodscas",
+    "mm": "mathmethods",
+    "maths1": "mathmethods",
+    "mmcas2": "mathmethodscas",
+    "specialist": "specialistmaths",
+    "specialistmathematics": "specialistmaths",
+    "specialistmaths": "specialistmaths",
+    "sm": "specialistmaths",
+    "chemistry": "chemistry",
+    "chem": "chemistry",
+}
+
+SUBJECT_DISPLAY_NAMES = {
+    "mathmethods": "Mathematical Methods",
+    "mathmethodscas": "Mathematical Methods (CAS)",
+    "specialistmaths": "Specialist Mathematics",
+    "chemistry": "Chemistry",
 }
 
 
@@ -255,16 +278,53 @@ class VCAASubjectScraperThread(QThread):
 
     @staticmethod
     def _normalise_subject_key(label: str) -> str:
-        cleaned = re.sub(r"\(.*?nht.*?\)", "", label, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\(.*?nht.*?\)", "", label or "", flags=re.IGNORECASE)
         cleaned = re.sub(
             r"northern\s+hemisphere\s+timetable",
-            "",
+            " ",
             cleaned,
             flags=re.IGNORECASE,
         )
-        cleaned = re.sub(r"\bnht\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"northern\s+hemisphere", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bnht\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b(examination|exam|report|reports|assessment|external|paper|papers|specification|specifications)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\b20\d{2}\b", " ", cleaned)
+        cleaned = re.sub(r"[^A-Za-z0-9\s]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        return cleaned.lower()
+        alias_key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+        return SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+
+    @staticmethod
+    def _canonicalize(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+    @staticmethod
+    def _clean_subject_label(text: str) -> str:
+        if not text:
+            return ""
+        spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        spaced = re.sub(r"\(.*?\)", " ", spaced)
+        spaced = re.sub(
+            r"northern\s+hemisphere\s+timetable|northern\s+hemisphere|\bnht\b",
+            " ",
+            spaced,
+            flags=re.IGNORECASE,
+        )
+        spaced = re.sub(
+            r"\b(examination|exam|report|reports|assessment|external|paper|papers|specification|specifications)\b",
+            " ",
+            spaced,
+            flags=re.IGNORECASE,
+        )
+        spaced = re.sub(r"\b20\d{2}\b", " ", spaced)
+        spaced = re.sub(r"[^A-Za-z0-9\s]+", " ", spaced)
+        spaced = re.sub(r"\s+", " ", spaced).strip()
+        return spaced.title()
 
     @staticmethod
     def _scrape_subject_page(page_url: str, headers: dict):
@@ -301,20 +361,106 @@ class VCAASubjectScraperThread(QThread):
             subjects[key]["urls"].append(full)
         return subjects
 
+    @staticmethod
+    def _extract_subject_from_nht_link(text: str, url: str, subjects: dict):
+        candidates = []
+        parsed = urlparse(url)
+        filename = unquote(parsed.path.split("/")[-1]) if parsed.path else ""
+        if filename:
+            candidates.append(Path(filename).stem)
+            file_subject, _, _ = parse_filename(Path(filename))
+            if file_subject and file_subject != "Unknown":
+                candidates.append(file_subject)
+        if text:
+            candidates.append(text)
+
+        cleaned_candidates = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            key = VCAASubjectScraperThread._normalise_subject_key(candidate)
+            if key and key in subjects:
+                label = subjects[key]["label"]
+                return key, label
+            cleaned_candidates.append((candidate, key))
+
+        for original, key in cleaned_candidates:
+            if not key:
+                continue
+            preferred_label = SUBJECT_DISPLAY_NAMES.get(key)
+            if not preferred_label:
+                preferred_label = VCAASubjectScraperThread._clean_subject_label(original)
+            if not preferred_label:
+                preferred_label = original.strip()
+            return key, preferred_label
+
+        return None, None
+
+    @classmethod
+    def _collect_nht_documents(cls, headers: dict, subjects: dict):
+        resp = requests.get(
+            VCAA_NHT_SUBJECTS_PAGE, headers=headers, timeout=30, verify=False
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        collected = {}
+        for link in soup.find_all("a", href=True):
+            text = link.get_text(strip=True)
+            href = link["href"].strip()
+            if not href:
+                continue
+            text_lower = (text or "").lower()
+            href_lower = href.lower()
+            if "nht" not in text_lower and "northern hemisphere" not in text_lower and "nht" not in href_lower:
+                continue
+            full = urljoin(VCAA_BASE, href)
+            parsed = urlparse(full)
+            path_lower = (parsed.path or "").lower()
+            if not path_lower.endswith((".pdf", ".doc", ".docx")):
+                continue
+            key, label = cls._extract_subject_from_nht_link(text, full, subjects)
+            if not key:
+                continue
+            entry = collected.setdefault(
+                key,
+                {
+                    "label": label
+                    or SUBJECT_DISPLAY_NAMES.get(key)
+                    or "",
+                    "urls": [],
+                },
+            )
+            if label:
+                entry["label"] = label
+            entry["urls"].append(full)
+        return collected
+
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
             subjects = self._scrape_subject_page(VCAA_SUBJECTS_PAGE, headers)
             try:
-                nht_subjects = self._scrape_subject_page(VCAA_NHT_SUBJECTS_PAGE, headers)
+                nht_subjects = self._collect_nht_documents(headers, subjects)
             except Exception:
                 nht_subjects = {}
 
             for key, info in nht_subjects.items():
-                if key in subjects:
-                    subjects[key]["urls"].extend(info["urls"])
-                else:
-                    subjects[key] = info
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(key) or info.get("label")
+                if not preferred_label:
+                    preferred_label = "NHT Subject"
+                entry = subjects.setdefault(
+                    key,
+                    {
+                        "label": preferred_label,
+                        "urls": [],
+                    },
+                )
+                if not entry.get("label") or (
+                    SUBJECT_DISPLAY_NAMES.get(key)
+                    and entry["label"] != SUBJECT_DISPLAY_NAMES[key]
+                ):
+                    entry["label"] = preferred_label
+                entry["urls"].extend(info.get("urls", []))
 
             for info in subjects.values():
                 seen_urls = set()
@@ -363,6 +509,12 @@ class VCAADownloadThread(QThread):
             links = []
 
             for page_url in self.subject_urls:
+                parsed = urlparse(page_url)
+                path_lower = (parsed.path or "").lower()
+                if path_lower.endswith((".pdf", ".doc", ".docx")):
+                    links.append(page_url)
+                    continue
+
                 resp = requests.get(
                     page_url, headers=headers, timeout=30, verify=False
                 )
