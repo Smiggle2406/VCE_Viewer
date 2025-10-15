@@ -367,38 +367,73 @@ class VCAASubjectScraperThread(QThread):
             subjects[key]["urls"].append({"url": full, "is_nht": False})
         return subjects
 
-    @staticmethod
-    def _extract_subject_from_nht_link(text: str, url: str, subjects: dict):
+    @classmethod
+    def _match_subject_candidate(cls, candidate: str, subjects: dict):
+        if not candidate:
+            return None, None
+
+        alias_key = cls._normalise_subject_key(candidate)
+        alias_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+        if alias_key in subjects:
+            label = subjects[alias_key].get("label")
+            if not label:
+                label = SUBJECT_DISPLAY_NAMES.get(alias_key) or candidate
+            return alias_key, label
+
+        cleaned = cls._clean_subject_label(candidate)
+        if cleaned and cleaned != candidate:
+            alias_key = cls._normalise_subject_key(cleaned)
+            alias_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+            if alias_key in subjects:
+                label = subjects[alias_key].get("label")
+                if not label:
+                    label = SUBJECT_DISPLAY_NAMES.get(alias_key) or cleaned
+                return alias_key, label
+
+        variants = set()
+        candidate_lower = (candidate or "").lower()
+        if candidate_lower:
+            variants.add(candidate_lower)
+        cleaned_lower = (cleaned or "").lower()
+        if cleaned_lower:
+            variants.add(cleaned_lower)
+
+        best = (None, None, 0)
+        for key, info in subjects.items():
+            label = info.get("label") or SUBJECT_DISPLAY_NAMES.get(key) or key
+            label_lower = (label or "").lower()
+            if not label_lower:
+                continue
+            for variant in variants:
+                if not variant:
+                    continue
+                if label_lower in variant or variant in label_lower:
+                    score = len(label_lower)
+                    if score > best[2]:
+                        best = (key, info.get("label") or label, score)
+        if best[0]:
+            return best[0], best[1]
+        return None, None
+
+    @classmethod
+    def _extract_subject_from_nht_link(cls, text: str, url: str, subjects: dict):
         candidates = []
         parsed = urlparse(url)
         filename = unquote(parsed.path.split("/")[-1]) if parsed.path else ""
         if filename:
-            candidates.append(Path(filename).stem)
+            stem = Path(filename).stem
+            if stem:
+                candidates.append(stem)
             file_subject, _, _ = parse_filename(Path(filename))
             if file_subject and file_subject != "Unknown":
                 candidates.append(file_subject)
         if text:
             candidates.append(text)
 
-        cleaned_candidates = []
         for candidate in candidates:
-            if not candidate:
-                continue
-            key = VCAASubjectScraperThread._normalise_subject_key(candidate)
-            if key and key in subjects:
-                label = subjects[key]["label"]
+            key, label = cls._match_subject_candidate(candidate, subjects)
+            if key:
                 return key, label
-            cleaned_candidates.append((candidate, key))
-
-        for original, key in cleaned_candidates:
-            if not key:
-                continue
-            preferred_label = SUBJECT_DISPLAY_NAMES.get(key)
-            if not preferred_label:
-                preferred_label = VCAASubjectScraperThread._clean_subject_label(original)
-            if not preferred_label:
-                preferred_label = original.strip()
-            return key, preferred_label
 
         return None, None
 
@@ -418,6 +453,8 @@ class VCAASubjectScraperThread(QThread):
             text_lower = (text or "").lower()
             href_lower = href.lower()
             if "nht" not in text_lower and "northern hemisphere" not in text_lower and "nht" not in href_lower:
+                continue
+            if REPORT_TOKEN not in text_lower and REPORT_TOKEN not in href_lower:
                 continue
             full = urljoin(VCAA_BASE, href)
             parsed = urlparse(full)
