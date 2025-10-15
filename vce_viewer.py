@@ -206,6 +206,18 @@ def parse_filename(file_path: Path, title_hint=None):
             exam_number = f"exam{ex_match.group(1)}"
             break
 
+    if exam_number == "Unknown":
+        word_match = re.search(
+            r"(?:exam|paper)[-_\s]*(one|two|i{1,3}|iv|v)\b",
+            combined,
+        )
+        if word_match:
+            token = word_match.group(1).lower()
+            token_map = {"one": "1", "two": "2", "i": "1", "ii": "2"}
+            mapped = token_map.get(token)
+            if mapped:
+                exam_number = f"exam{mapped}"
+
     name = combined
     name = re.sub(
         r"[-_\s]?(assessrep|examreport|examrep|externalassessmentreport|report|exam)",
@@ -232,13 +244,23 @@ def parse_filename(file_path: Path, title_hint=None):
                 exam_number = f"exam{trailing_digit.group(1)}"
                 name = re.sub(r"\d$", "", name).strip()
 
+    tokens = [t for t in re.split(r"[^a-z0-9]+", combined) if t]
+    joined = "".join(tokens)
+
     subject = "Unknown"
-    for key in SUBJECT_ALIASES:
-        if key in name:
-            subject = SUBJECT_ALIASES[key]
-            break
+    for key, canonical in SUBJECT_ALIASES.items():
+        if len(key) <= 3:
+            if key in tokens or any(tok.startswith(key) for tok in tokens):
+                subject = canonical
+                break
+        else:
+            if key in tokens or (key in joined if joined else False):
+                subject = canonical
+                break
+
     if subject == "Unknown" and name:
-        subject = name.title()
+        fallback = " ".join(t for t in tokens if t)
+        subject = fallback.title() if fallback else "Unknown"
 
     return subject, year, exam_number
 
@@ -1095,10 +1117,6 @@ class VCEViewer(QMainWindow):
             lbl = QLabel(label_text)
             lbl.setStyleSheet("font-weight: 500;")
             vbox.addWidget(lbl)
-
-            details = QLabel(entry["path"].name)
-            details.setStyleSheet("color: #666; font-size: 11px;")
-            vbox.addWidget(details)
 
             show_bar = (entry["path"].suffix.lower() in WORD_EXTENSIONS) and (
                     entry["pdf_path"] is None
