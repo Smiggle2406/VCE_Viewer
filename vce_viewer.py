@@ -200,6 +200,82 @@ def soffice_cmd():
 
 
 # ------------------ PARSING ------------------
+def _extract_exam_number_from_text(text):
+    if not text:
+        return None
+
+    lower = str(text).lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", lower) if t]
+
+    exam_patterns = [
+        r"exam\s*(?:number|no\.?)?\s*([12])",
+        r"exam[-_\s]*([12])",
+        r"examrep(?:ort)?[-_\s]*([12])",
+        r"exam\s*report[-_\s]*([12])",
+        r"assess(?:ment)?\s*rep(?:ort)?[-_\s]*([12])",
+        r"assessment\s*report[-_\s]*([12])",
+        r"externalassessmentreport[-_\s]*([12])",
+        r"paper\s*(?:number|no\.?)?\s*([12])",
+        r"paper[-_\s]*([12])",
+        r"report\s*(?:number|no\.?)?\s*([12])",
+        r"report[-_\s]*([12])",
+    ]
+    for pattern in exam_patterns:
+        ex_match = re.search(pattern, lower)
+        if ex_match:
+            return f"exam{ex_match.group(1)}"
+
+    word_match = re.search(
+        r"(?:exam|paper|report|assessment|section|part)[-_\s]*(one|two|i{1,3}|iv|v)\b",
+        lower,
+    )
+    if word_match:
+        token = word_match.group(1).lower()
+        token_map = {"one": "1", "two": "2", "i": "1", "ii": "2"}
+        mapped = token_map.get(token)
+        if mapped:
+            return f"exam{mapped}"
+
+    for token in tokens:
+        compact_match = re.match(
+            r"(?:exam|ex|paper|report|assessment)(?:rep(?:ort)?)?([12])$",
+            token,
+        )
+        if compact_match:
+            return f"exam{compact_match.group(1)}"
+
+    for idx, tok in enumerate(tokens):
+        if tok in {"1", "2"}:
+            window = tokens[max(0, idx - 2) : idx + 3]
+            if any(
+                t
+                in {
+                    "exam",
+                    "ex",
+                    "paper",
+                    "report",
+                    "assessment",
+                    "examreport",
+                    "examrep",
+                    "assessmentreport",
+                }
+                for t in window
+            ):
+                return f"exam{tok}"
+
+    joined = "".join(tokens)
+    joined_match = re.search(r"exam([12])", joined)
+    if joined_match:
+        return f"exam{joined_match.group(1)}"
+
+    if tokens:
+        tail = tokens[-1]
+        if tail in {"1", "2"}:
+            return f"exam{tail}"
+
+    return None
+
+
 def parse_filename(file_path: Path, title_hint=None):
     """
     Parse (best-effort) subject, year and exam number from a file path's name.
@@ -224,36 +300,15 @@ def parse_filename(file_path: Path, title_hint=None):
                 year = f"20{y:02d}"
 
     exam_number = "Unknown"
-    exam_patterns = [
-        r"exam\s*(?:number|no\.?)?\s*([12])",
-        r"exam[-_\s]*([12])",
-        r"examrep(?:ort)?[-_\s]*([12])",
-        r"exam\s*report[-_\s]*([12])",
-        r"assess(?:ment)?\s*rep(?:ort)?[-_\s]*([12])",
-        r"assessment\s*report[-_\s]*([12])",
-        r"externalassessmentreport[-_\s]*([12])",
-        r"paper\s*(?:number|no\.?)?\s*([12])",
-        r"paper[-_\s]*([12])",
-        r"report\s*(?:number|no\.?)?\s*([12])",
-        r"report[-_\s]*([12])",
-    ]
-    for pattern in exam_patterns:
-        ex_match = re.search(pattern, combined)
-        if ex_match:
-            exam_number = f"exam{ex_match.group(1)}"
+    for source in (title_hint, file_path.stem if file_path else None):
+        candidate = _extract_exam_number_from_text(source)
+        if candidate:
+            exam_number = candidate
             break
-
     if exam_number == "Unknown":
-        word_match = re.search(
-            r"(?:exam|paper)[-_\s]*(one|two|i{1,3}|iv|v)\b",
-            combined,
-        )
-        if word_match:
-            token = word_match.group(1).lower()
-            token_map = {"one": "1", "two": "2", "i": "1", "ii": "2"}
-            mapped = token_map.get(token)
-            if mapped:
-                exam_number = f"exam{mapped}"
+        candidate = _extract_exam_number_from_text(combined)
+        if candidate:
+            exam_number = candidate
 
     name = combined
     name = re.sub(
@@ -269,30 +324,6 @@ def parse_filename(file_path: Path, title_hint=None):
     name = re.sub(r"\bnht\b", " ", name)
     name = re.sub(r"[^a-z0-9\s]+", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
-
-    if exam_number == "Unknown":
-        ex_match = re.search(r"(?:ex|exam)?[-_\s]?([12])\b", name)
-        if ex_match:
-            exam_number = f"exam{ex_match.group(1)}"
-            name = re.sub(r"(?:ex|exam)?[-_\s]?[12]\b", "", name).strip()
-        else:
-            trailing_digit = re.search(r"(\d)$", name)
-            if trailing_digit:
-                exam_number = f"exam{trailing_digit.group(1)}"
-                name = re.sub(r"\d$", "", name).strip()
-
-    if exam_number == "Unknown":
-        context_tokens = {"exam", "paper", "report", "assessment", "examreport", "examrep"}
-        if any(t in context_tokens for t in tokens):
-            for tok in tokens:
-                if tok in {"1", "2"}:
-                    exam_number = f"exam{tok}"
-                    break
-
-    if exam_number == "Unknown":
-        ex_match = re.search(r"(?:part|section)\s*([12])", combined)
-        if ex_match:
-            exam_number = f"exam{ex_match.group(1)}"
 
     subject = "Unknown"
     for key, canonical in SUBJECT_ALIASES.items():
