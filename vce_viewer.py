@@ -103,11 +103,21 @@ SUBJECT_ALIASES = {
     "maths1": "MathMethods",
     "mm": "MathMethods",
     "mmcas2": "MathMethodsCAS",
+    "mm1": "MathMethods",
+    "mm2": "MathMethods",
     "specialist": "SpecialistMaths",
     "sm": "SpecialistMaths",
+    "spec": "SpecialistMaths",
+    "spesh": "SpecialistMaths",
+    "specmaths": "SpecialistMaths",
     "furthermathematics": "FurtherMathematics",
     "furthermaths": "FurtherMathematics",
     "fmaths": "FurtherMathematics",
+    "fmath": "FurtherMathematics",
+    "further": "FurtherMathematics",
+    "fm": "FurtherMathematics",
+    "fm1": "FurtherMathematics",
+    "fm2": "FurtherMathematics",
     "chemistry": "Chemistry",
     "chem": "Chemistry",
 }
@@ -124,13 +134,23 @@ SUBJECT_KEY_ALIASES = {
     "mm": "mathmethods",
     "maths1": "mathmethods",
     "mmcas2": "mathmethodscas",
+    "mm1": "mathmethods",
+    "mm2": "mathmethods",
     "specialist": "specialistmaths",
     "specialistmathematics": "specialistmaths",
     "specialistmaths": "specialistmaths",
     "sm": "specialistmaths",
+    "spec": "specialistmaths",
+    "spesh": "specialistmaths",
+    "specmaths": "specialistmaths",
     "furthermathematics": "furthermathematics",
     "furthermaths": "furthermathematics",
     "fmaths": "furthermathematics",
+    "fmath": "furthermathematics",
+    "further": "furthermathematics",
+    "fm": "furthermathematics",
+    "fm1": "furthermathematics",
+    "fm2": "furthermathematics",
     "chemistry": "chemistry",
     "chem": "chemistry",
 }
@@ -189,6 +209,8 @@ def parse_filename(file_path: Path, title_hint=None):
     if title_hint:
         raw_parts.append(str(title_hint))
     combined = " ".join(p for p in raw_parts if p).lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", combined) if t]
+    joined = "".join(tokens)
 
     year = "Unknown"
     year_match = re.search(r"(20\d{2})", combined)
@@ -203,12 +225,16 @@ def parse_filename(file_path: Path, title_hint=None):
 
     exam_number = "Unknown"
     exam_patterns = [
-        r"exam\s*(?:number\s*)?([12])",
-        r"exam[-_]?([12])",
+        r"exam\s*(?:number|no\.?)?\s*([12])",
+        r"exam[-_\s]*([12])",
         r"examrep(?:ort)?[-_\s]*([12])",
-        r"assess(?:ment)?rep(?:ort)?[-_\s]*([12])",
+        r"exam\s*report[-_\s]*([12])",
+        r"assess(?:ment)?\s*rep(?:ort)?[-_\s]*([12])",
+        r"assessment\s*report[-_\s]*([12])",
         r"externalassessmentreport[-_\s]*([12])",
+        r"paper\s*(?:number|no\.?)?\s*([12])",
         r"paper[-_\s]*([12])",
+        r"report\s*(?:number|no\.?)?\s*([12])",
         r"report[-_\s]*([12])",
     ]
     for pattern in exam_patterns:
@@ -255,8 +281,18 @@ def parse_filename(file_path: Path, title_hint=None):
                 exam_number = f"exam{trailing_digit.group(1)}"
                 name = re.sub(r"\d$", "", name).strip()
 
-    tokens = [t for t in re.split(r"[^a-z0-9]+", combined) if t]
-    joined = "".join(tokens)
+    if exam_number == "Unknown":
+        context_tokens = {"exam", "paper", "report", "assessment", "examreport", "examrep"}
+        if any(t in context_tokens for t in tokens):
+            for tok in tokens:
+                if tok in {"1", "2"}:
+                    exam_number = f"exam{tok}"
+                    break
+
+    if exam_number == "Unknown":
+        ex_match = re.search(r"(?:part|section)\s*([12])", combined)
+        if ex_match:
+            exam_number = f"exam{ex_match.group(1)}"
 
     subject = "Unknown"
     for key, canonical in SUBJECT_ALIASES.items():
@@ -435,7 +471,7 @@ class VCAASubjectScraperThread(QThread):
                     "urls": [],
                 },
             )
-            subjects[key]["urls"].append({"url": full, "is_nht": False})
+            subjects[key]["urls"].append({"url": full, "is_nht": False, "title": text})
         return subjects
 
     @classmethod
@@ -620,8 +656,10 @@ class VCAASubjectScraperThread(QThread):
                     if url in seen_urls:
                         if is_nht:
                             seen_urls[url]["is_nht"] = True
-                        if title and not seen_urls[url].get("title"):
-                            seen_urls[url]["title"] = title
+                        if title:
+                            existing = seen_urls[url].get("title")
+                            if not existing or len(title) > len(existing):
+                                seen_urls[url]["title"] = title
                         continue
                     stored = {"url": url, "is_nht": is_nht}
                     if title:
@@ -733,8 +771,10 @@ class VCAADownloadThread(QThread):
                 if url in seen:
                     if is_nht:
                         seen[url]["is_nht"] = True
-                    if title and not seen[url].get("title"):
-                        seen[url]["title"] = title
+                    if title:
+                        existing = seen[url].get("title")
+                        if not existing or len(title) > len(existing):
+                            seen[url]["title"] = title
                     continue
                 stored = {"url": url, "is_nht": is_nht}
                 if title:
