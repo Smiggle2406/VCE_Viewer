@@ -358,7 +358,7 @@ class VCAASubjectScraperThread(QThread):
                     "urls": [],
                 },
             )
-            subjects[key]["urls"].append(full)
+            subjects[key]["urls"].append({"url": full, "is_nht": False})
         return subjects
 
     @staticmethod
@@ -432,44 +432,80 @@ class VCAASubjectScraperThread(QThread):
             )
             if label:
                 entry["label"] = label
-            entry["urls"].append(full)
+            entry["urls"].append({"url": full, "is_nht": True})
         return collected
 
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
             subjects = self._scrape_subject_page(VCAA_SUBJECTS_PAGE, headers)
+            normalised_subjects = {}
+            for key, info in subjects.items():
+                label = info.get("label") or key
+                alias_key = self._normalise_subject_key(label)
+                canonical_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key) if alias_key else key
+                canonical_key = SUBJECT_KEY_ALIASES.get(canonical_key, canonical_key)
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(canonical_key) or label
+                entry = normalised_subjects.setdefault(
+                    canonical_key,
+                    {
+                        "label": preferred_label,
+                        "urls": [],
+                    },
+                )
+                if SUBJECT_DISPLAY_NAMES.get(canonical_key):
+                    entry["label"] = SUBJECT_DISPLAY_NAMES[canonical_key]
+                elif info.get("label") and not entry.get("label"):
+                    entry["label"] = info["label"]
+                entry["urls"].extend(info.get("urls", []))
+            subjects = normalised_subjects
             try:
                 nht_subjects = self._collect_nht_documents(headers, subjects)
             except Exception:
                 nht_subjects = {}
 
             for key, info in nht_subjects.items():
-                preferred_label = SUBJECT_DISPLAY_NAMES.get(key) or info.get("label")
+                canonical_key = SUBJECT_KEY_ALIASES.get(key, key)
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(canonical_key) or info.get("label")
                 if not preferred_label:
                     preferred_label = "NHT Subject"
                 entry = subjects.setdefault(
-                    key,
+                    canonical_key,
                     {
                         "label": preferred_label,
                         "urls": [],
                     },
                 )
-                if not entry.get("label") or (
-                    SUBJECT_DISPLAY_NAMES.get(key)
-                    and entry["label"] != SUBJECT_DISPLAY_NAMES[key]
-                ):
+                if SUBJECT_DISPLAY_NAMES.get(canonical_key):
+                    entry["label"] = SUBJECT_DISPLAY_NAMES[canonical_key]
+                elif not entry.get("label"):
                     entry["label"] = preferred_label
                 entry["urls"].extend(info.get("urls", []))
 
-            for info in subjects.values():
-                seen_urls = set()
+            for key, info in subjects.items():
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(key)
+                if preferred_label:
+                    info["label"] = preferred_label
+                elif not info.get("label"):
+                    info["label"] = self._clean_subject_label(key)
+                seen_urls = {}
                 unique_urls = []
-                for url in info["urls"]:
-                    if url in seen_urls:
+                for entry in info.get("urls", []):
+                    if isinstance(entry, dict):
+                        url = entry.get("url")
+                        is_nht = bool(entry.get("is_nht"))
+                    else:
+                        url = entry
+                        is_nht = False
+                    if not url:
                         continue
-                    seen_urls.add(url)
-                    unique_urls.append(url)
+                    if url in seen_urls:
+                        if is_nht:
+                            seen_urls[url]["is_nht"] = True
+                        continue
+                    stored = {"url": url, "is_nht": is_nht}
+                    seen_urls[url] = stored
+                    unique_urls.append(stored)
                 info["urls"] = unique_urls
 
             if not subjects:
@@ -508,11 +544,28 @@ class VCAADownloadThread(QThread):
             headers = {"User-Agent": "Mozilla/5.0"}
             links = []
 
-            for page_url in self.subject_urls:
+            for source in self.subject_urls:
+                if isinstance(source, dict):
+                    page_url = source.get("url")
+                    source_is_nht = bool(source.get("is_nht"))
+                else:
+                    page_url = source
+                    source_is_nht = False
+                if not page_url:
+                    continue
+
                 parsed = urlparse(page_url)
                 path_lower = (parsed.path or "").lower()
                 if path_lower.endswith((".pdf", ".doc", ".docx")):
-                    links.append(page_url)
+                    links.append(
+                        {
+                            "url": page_url,
+                            "is_nht": source_is_nht
+                            or "nht" in path_lower
+                            or "northern-hemisphere" in path_lower
+                            or "northernhemisphere" in path_lower,
+                        }
+                    )
                     continue
 
                 resp = requests.get(
@@ -528,16 +581,35 @@ class VCAADownloadThread(QThread):
                         continue
                     if self._should_skip(href, text):
                         continue
-                    links.append(urljoin(VCAA_BASE, href))
+                    file_url = urljoin(VCAA_BASE, href)
+                    combined_lower = href.lower()
+                    text_lower = (text or "").lower()
+                    links.append(
+                        {
+                            "url": file_url,
+                            "is_nht": source_is_nht
+                            or "nht" in combined_lower
+                            or "northern hemisphere" in text_lower
+                            or "northern-hemisphere" in combined_lower
+                            or "northernhemisphere" in combined_lower,
+                        }
+                    )
 
             # Preserve ordering while removing duplicates
-            seen = set()
+            seen = {}
             unique_links = []
             for link in links:
-                if link in seen:
+                url = link.get("url") if isinstance(link, dict) else link
+                if not url:
                     continue
-                seen.add(link)
-                unique_links.append(link)
+                is_nht = bool(link.get("is_nht")) if isinstance(link, dict) else False
+                if url in seen:
+                    if is_nht:
+                        seen[url]["is_nht"] = True
+                    continue
+                stored = {"url": url, "is_nht": is_nht}
+                seen[url] = stored
+                unique_links.append(stored)
 
             total = len(unique_links)
             if total == 0:
@@ -552,8 +624,10 @@ class VCAADownloadThread(QThread):
             completed = 0
             lock = threading.Lock()
 
-            def download_one(file_url):
+            def download_one(link_info):
                 nonlocal completed
+                file_url = link_info.get("url") if isinstance(link_info, dict) else link_info
+                is_nht_doc = bool(link_info.get("is_nht")) if isinstance(link_info, dict) else False
                 filename = file_url.split("/")[-1]
                 try:
                     r = requests.get(
@@ -572,6 +646,8 @@ class VCAADownloadThread(QThread):
                         parts.append(year)
                     if exam_number and exam_number != "Unknown":
                         parts.append(exam_number)
+                    if is_nht_doc or "nht" in filename.lower():
+                        parts.append("NHT")
                     final_stem = "_".join(parts) if parts else temp_path.stem
                     final_path = subject_folder / f"{final_stem}{ext}"
 
@@ -594,7 +670,7 @@ class VCAADownloadThread(QThread):
             self.progress.emit("Starting concurrent downloads...", 0, total)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(download_one, url) for url in unique_links]
+                futures = [executor.submit(download_one, link) for link in unique_links]
                 concurrent.futures.wait(futures)
 
             self.finished.emit(f"All reports for {self.subject_name} downloaded.")
