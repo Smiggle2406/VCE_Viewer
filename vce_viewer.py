@@ -5,12 +5,13 @@ import subprocess
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 import concurrent.futures
 import threading
 
 import shutil as _shutil
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint
@@ -62,10 +63,20 @@ WORD_EXTENSIONS = {".doc", ".docx"}
 
 VCAA_BASE = "https://www.vcaa.vic.edu.au"
 VCAA_SUBJECTS_PAGE = (
-        VCAA_BASE
-        + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
-        + "examination-specifications-past-examinations-and-external-assessment-reports"
+    VCAA_BASE
+    + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
+    + "examination-specifications-past-examinations-and-external-assessment-reports"
 )
+VCAA_NHT_SUBJECTS_PAGE = (
+    VCAA_BASE
+    + "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
+    + "nht-examination-specifications-past-examinations-and-examination-reports"
+)
+VCAA_SUBJECTS_PREFIX = (
+    "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
+)
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 EXCLUDE_HINTS = [
     "sample",
@@ -84,6 +95,8 @@ SUBJECT_ALIASES = {
     "mathmethodscas": "MathMethodsCAS",
     "mathematicalmethods": "MathMethods",
     "mathmethods": "MathMethods",
+    "methods": "MathMethods",
+    "method": "MathMethods",
     "mmcas": "MathMethodsCAS",
     "maths1": "MathMethods",
     "mm": "MathMethods",
@@ -92,6 +105,31 @@ SUBJECT_ALIASES = {
     "sm": "SpecialistMaths",
     "chemistry": "Chemistry",
     "chem": "Chemistry",
+}
+
+SUBJECT_KEY_ALIASES = {
+    "mathmethodscas": "mathmethodscas",
+    "mathematicalmethods": "mathmethods",
+    "mathmethods": "mathmethods",
+    "methods": "mathmethods",
+    "method": "mathmethods",
+    "mmcas": "mathmethodscas",
+    "mm": "mathmethods",
+    "maths1": "mathmethods",
+    "mmcas2": "mathmethodscas",
+    "specialist": "specialistmaths",
+    "specialistmathematics": "specialistmaths",
+    "specialistmaths": "specialistmaths",
+    "sm": "specialistmaths",
+    "chemistry": "chemistry",
+    "chem": "chemistry",
+}
+
+SUBJECT_DISPLAY_NAMES = {
+    "mathmethods": "Mathematical Methods",
+    "mathmethodscas": "Mathematical Methods (CAS)",
+    "specialistmaths": "Specialist Mathematics",
+    "chemistry": "Chemistry",
 }
 
 
@@ -131,43 +169,68 @@ def soffice_cmd():
 
 
 # ------------------ PARSING ------------------
-def parse_filename(file_path: Path):
+def parse_filename(file_path: Path, title_hint=None):
     """
     Parse (best-effort) subject, year and exam number from a file path's name.
     Returns: (subject, year, exam_number)
     """
-    name = file_path.stem.lower()
+    raw_parts = [file_path.stem]
+    if title_hint:
+        raw_parts.append(str(title_hint))
+    combined = " ".join(p for p in raw_parts if p).lower()
+
+    year = "Unknown"
+    year_match = re.search(r"(20\d{2})", combined)
+    if year_match:
+        year = year_match.group(1)
+    else:
+        trailing_pair = re.search(r"\b(\d{2})\b", combined)
+        if trailing_pair:
+            y = int(trailing_pair.group(1))
+            if 0 <= y <= 30:
+                year = f"20{y:02d}"
+
+    exam_number = "Unknown"
+    exam_patterns = [
+        r"exam\s*(?:number\s*)?([12])",
+        r"exam[-_]?([12])",
+        r"examrep(?:ort)?[-_\s]*([12])",
+        r"assess(?:ment)?rep(?:ort)?[-_\s]*([12])",
+        r"externalassessmentreport[-_\s]*([12])",
+        r"paper[-_\s]*([12])",
+        r"report[-_\s]*([12])",
+    ]
+    for pattern in exam_patterns:
+        ex_match = re.search(pattern, combined)
+        if ex_match:
+            exam_number = f"exam{ex_match.group(1)}"
+            break
+
+    name = combined
     name = re.sub(
         r"[-_\s]?(assessrep|examreport|examrep|externalassessmentreport|report|exam)",
-        "",
+        " ",
         name,
     )
     name = re.sub(r"\s*\(\d+\)", "", name)
-    name = name.strip()
+    if year != "Unknown":
+        name = name.replace(year.lower(), " ")
+    name = re.sub(r"\b20\d{2}\b", " ", name)
+    name = re.sub(r"\bnorthern\s+hemisphere(?:\s+timetable)?\b", " ", name)
+    name = re.sub(r"\bnht\b", " ", name)
+    name = re.sub(r"[^a-z0-9\s]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
 
-    year = "Unknown"
-    year_match = re.search(r"(20\d{2})", name)
-    if year_match:
-        year = year_match.group(1)
-        name = name.replace(year, "").strip("-_ ")
-    else:
-        trailing_digit = re.search(r"(\d{2})$", name)
-        if trailing_digit:
-            y = int(trailing_digit.group(1))
-            if y <= 30:
-                year = f"20{y:02d}"
-                name = re.sub(r"\d{2}$", "", name).strip("-_ ")
-
-    exam_number = "Unknown"
-    ex_match = re.search(r"(?:ex|exam)?[-_]?([12])\b", name)
-    if ex_match:
-        exam_number = f"exam{ex_match.group(1)}"
-        name = re.sub(r"(?:ex|exam)?[-_]?[12]\b", "", name).strip("-_ ")
-    else:
-        trailing_digit = re.search(r"(\d)$", name)
-        if trailing_digit:
-            exam_number = f"exam{trailing_digit.group(1)}"
-            name = re.sub(r"\d$", "", name).strip("-_ ")
+    if exam_number == "Unknown":
+        ex_match = re.search(r"(?:ex|exam)?[-_\s]?([12])\b", name)
+        if ex_match:
+            exam_number = f"exam{ex_match.group(1)}"
+            name = re.sub(r"(?:ex|exam)?[-_\s]?[12]\b", "", name).strip()
+        else:
+            trailing_digit = re.search(r"(\d)$", name)
+            if trailing_digit:
+                exam_number = f"exam{trailing_digit.group(1)}"
+                name = re.sub(r"\d$", "", name).strip()
 
     subject = "Unknown"
     for key in SUBJECT_ALIASES:
@@ -242,30 +305,285 @@ class VCAASubjectScraperThread(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
+    @staticmethod
+    def _normalise_subject_key(label: str) -> str:
+        cleaned = re.sub(r"\(.*?nht.*?\)", "", label or "", flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"northern\s+hemisphere\s+timetable",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"northern\s+hemisphere", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bnht\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b(examination|exam|report|reports|assessment|external|paper|papers|specification|specifications)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\b20\d{2}\b", " ", cleaned)
+        cleaned = re.sub(r"[^A-Za-z0-9\s]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        alias_key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+        return SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+
+    @staticmethod
+    def _canonicalize(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+    @staticmethod
+    def _clean_subject_label(text: str) -> str:
+        if not text:
+            return ""
+        spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        spaced = re.sub(r"\(.*?\)", " ", spaced)
+        spaced = re.sub(
+            r"northern\s+hemisphere\s+timetable|northern\s+hemisphere|\bnht\b",
+            " ",
+            spaced,
+            flags=re.IGNORECASE,
+        )
+        spaced = re.sub(
+            r"\b(examination|exam|report|reports|assessment|external|paper|papers|specification|specifications)\b",
+            " ",
+            spaced,
+            flags=re.IGNORECASE,
+        )
+        spaced = re.sub(r"\b20\d{2}\b", " ", spaced)
+        spaced = re.sub(r"[^A-Za-z0-9\s]+", " ", spaced)
+        spaced = re.sub(r"\s+", " ", spaced).strip()
+        return spaced.title()
+
+    @staticmethod
+    def _scrape_subject_page(page_url: str, headers: dict):
+        resp = requests.get(page_url, headers=headers, timeout=30, verify=False)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        subjects = {}
+        for link in soup.find_all("a", href=True):
+            text = link.get_text(strip=True)
+            href = link["href"].strip()
+            if not href or not text:
+                continue
+            full = urljoin(VCAA_BASE, href)
+            path_lower = full.lower()
+            if "/vce-vet-" in path_lower:
+                continue
+            if VCAA_SUBJECTS_PREFIX not in path_lower:
+                continue
+            full_stripped = full.rstrip("/")
+            if full_stripped in {
+                page_url.rstrip("/"),
+                VCAA_SUBJECTS_PAGE.rstrip("/"),
+                VCAA_NHT_SUBJECTS_PAGE.rstrip("/"),
+            }:
+                continue
+            key = VCAASubjectScraperThread._normalise_subject_key(text)
+            subjects.setdefault(
+                key,
+                {
+                    "label": text,
+                    "urls": [],
+                },
+            )
+            subjects[key]["urls"].append({"url": full, "is_nht": False})
+        return subjects
+
+    @classmethod
+    def _match_subject_candidate(cls, candidate: str, subjects: dict):
+        if not candidate:
+            return None, None
+
+        alias_key = cls._normalise_subject_key(candidate)
+        alias_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+        if alias_key in subjects:
+            label = subjects[alias_key].get("label")
+            if not label:
+                label = SUBJECT_DISPLAY_NAMES.get(alias_key) or candidate
+            return alias_key, label
+
+        cleaned = cls._clean_subject_label(candidate)
+        if cleaned and cleaned != candidate:
+            alias_key = cls._normalise_subject_key(cleaned)
+            alias_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key)
+            if alias_key in subjects:
+                label = subjects[alias_key].get("label")
+                if not label:
+                    label = SUBJECT_DISPLAY_NAMES.get(alias_key) or cleaned
+                return alias_key, label
+
+        variants = set()
+        candidate_lower = (candidate or "").lower()
+        if candidate_lower:
+            variants.add(candidate_lower)
+        cleaned_lower = (cleaned or "").lower()
+        if cleaned_lower:
+            variants.add(cleaned_lower)
+
+        best = (None, None, 0)
+        for key, info in subjects.items():
+            label = info.get("label") or SUBJECT_DISPLAY_NAMES.get(key) or key
+            label_lower = (label or "").lower()
+            if not label_lower:
+                continue
+            for variant in variants:
+                if not variant:
+                    continue
+                if label_lower in variant or variant in label_lower:
+                    score = len(label_lower)
+                    if score > best[2]:
+                        best = (key, info.get("label") or label, score)
+        if best[0]:
+            return best[0], best[1]
+        return None, None
+
+    @classmethod
+    def _extract_subject_from_nht_link(cls, text: str, url: str, subjects: dict):
+        candidates = []
+        parsed = urlparse(url)
+        filename = unquote(parsed.path.split("/")[-1]) if parsed.path else ""
+        if filename:
+            stem = Path(filename).stem
+            if stem:
+                candidates.append(stem)
+            file_subject, _, _ = parse_filename(Path(filename), title_hint=text)
+            if file_subject and file_subject != "Unknown":
+                candidates.append(file_subject)
+        if text:
+            candidates.append(text)
+        if parsed.path:
+            for segment in parsed.path.split("/"):
+                if segment:
+                    candidates.append(segment)
+
+        for candidate in candidates:
+            key, label = cls._match_subject_candidate(candidate, subjects)
+            if key:
+                return key, label
+
+        return None, None
+
+    @classmethod
+    def _collect_nht_documents(cls, headers: dict, subjects: dict):
+        resp = requests.get(
+            VCAA_NHT_SUBJECTS_PAGE, headers=headers, timeout=30, verify=False
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        collected = {}
+        for link in soup.find_all("a", href=True):
+            text = link.get_text(strip=True)
+            href = link["href"].strip()
+            if not href:
+                continue
+            text_lower = (text or "").lower()
+            href_lower = href.lower()
+            if "nht" not in text_lower and "northern hemisphere" not in text_lower and "nht" not in href_lower:
+                continue
+            if REPORT_TOKEN not in text_lower and REPORT_TOKEN not in href_lower:
+                continue
+            full = urljoin(VCAA_BASE, href)
+            parsed = urlparse(full)
+            path_lower = (parsed.path or "").lower()
+            if not path_lower.endswith((".pdf", ".doc", ".docx")):
+                continue
+            key, label = cls._extract_subject_from_nht_link(text, full, subjects)
+            if not key:
+                continue
+            entry = collected.setdefault(
+                key,
+                {
+                    "label": label
+                    or SUBJECT_DISPLAY_NAMES.get(key)
+                    or "",
+                    "urls": [],
+                },
+            )
+            if label:
+                entry["label"] = label
+            entry["urls"].append({"url": full, "is_nht": True, "title": text})
+        return collected
+
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(
-                VCAA_SUBJECTS_PAGE, headers=headers, timeout=30
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            subjects = {}
-            for link in soup.find_all("a", href=True):
-                text = link.get_text(strip=True)
-                href = link["href"].strip()
-                if not href:
-                    continue
-                full = urljoin(VCAA_BASE, href)
-                path_lower = full.lower()
-                if "/vce-vet-" in path_lower:
-                    continue
-                if (
-                        "/assessment/vce/examination-specifications-past-examinations-and-examination-reports/"
-                        in path_lower
-                ):
-                    if full.rstrip("/") != VCAA_SUBJECTS_PAGE.rstrip("/") and text:
-                        subjects[text] = full
+            subjects = self._scrape_subject_page(VCAA_SUBJECTS_PAGE, headers)
+            normalised_subjects = {}
+            for key, info in subjects.items():
+                label = info.get("label") or key
+                alias_key = self._normalise_subject_key(label)
+                canonical_key = SUBJECT_KEY_ALIASES.get(alias_key, alias_key) if alias_key else key
+                canonical_key = SUBJECT_KEY_ALIASES.get(canonical_key, canonical_key)
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(canonical_key) or label
+                entry = normalised_subjects.setdefault(
+                    canonical_key,
+                    {
+                        "label": preferred_label,
+                        "urls": [],
+                    },
+                )
+                if SUBJECT_DISPLAY_NAMES.get(canonical_key):
+                    entry["label"] = SUBJECT_DISPLAY_NAMES[canonical_key]
+                elif info.get("label") and not entry.get("label"):
+                    entry["label"] = info["label"]
+                entry["urls"].extend(info.get("urls", []))
+            subjects = normalised_subjects
+            try:
+                nht_subjects = self._collect_nht_documents(headers, subjects)
+            except Exception:
+                nht_subjects = {}
+
+            for key, info in nht_subjects.items():
+                canonical_key = SUBJECT_KEY_ALIASES.get(key, key)
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(canonical_key) or info.get("label")
+                if not preferred_label:
+                    preferred_label = "NHT Subject"
+                entry = subjects.setdefault(
+                    canonical_key,
+                    {
+                        "label": preferred_label,
+                        "urls": [],
+                    },
+                )
+                if SUBJECT_DISPLAY_NAMES.get(canonical_key):
+                    entry["label"] = SUBJECT_DISPLAY_NAMES[canonical_key]
+                elif not entry.get("label"):
+                    entry["label"] = preferred_label
+                entry["urls"].extend(info.get("urls", []))
+
+            for key, info in subjects.items():
+                preferred_label = SUBJECT_DISPLAY_NAMES.get(key)
+                if preferred_label:
+                    info["label"] = preferred_label
+                elif not info.get("label"):
+                    info["label"] = self._clean_subject_label(key)
+                seen_urls = {}
+                unique_urls = []
+                for entry in info.get("urls", []):
+                    if isinstance(entry, dict):
+                        url = entry.get("url")
+                        is_nht = bool(entry.get("is_nht"))
+                        title = entry.get("title")
+                    else:
+                        url = entry
+                        is_nht = False
+                        title = None
+                    if not url:
+                        continue
+                    if url in seen_urls:
+                        if is_nht:
+                            seen_urls[url]["is_nht"] = True
+                        if title and not seen_urls[url].get("title"):
+                            seen_urls[url]["title"] = title
+                        continue
+                    stored = {"url": url, "is_nht": is_nht}
+                    if title:
+                        stored["title"] = title
+                    seen_urls[url] = stored
+                    unique_urls.append(stored)
+                info["urls"] = unique_urls
+
             if not subjects:
                 self.error.emit("No subjects found on the VCAA index page.")
             else:
@@ -280,10 +598,10 @@ class VCAADownloadThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, subject_name, subject_url):
+    def __init__(self, subject_name, subject_urls):
         super().__init__()
         self.subject_name = subject_name
-        self.subject_url = subject_url
+        self.subject_urls = subject_urls if isinstance(subject_urls, (list, tuple)) else [subject_urls]
 
     @staticmethod
     def _should_skip(link_href: str, link_text: str) -> bool:
@@ -291,7 +609,7 @@ class VCAADownloadThread(QThread):
         t = (link_text or "").lower()
         if any(k in h or k in t for k in EXCLUDE_HINTS):
             return True
-        if REPORT_TOKEN not in t:
+        if REPORT_TOKEN not in t and REPORT_TOKEN not in h:
             return True
         if not (h.endswith(".pdf") or h.endswith(".docx") or h.endswith(".doc")):
             return True
@@ -300,23 +618,85 @@ class VCAADownloadThread(QThread):
     def run(self):
         try:
             headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(
-                self.subject_url, headers=headers, timeout=30
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
             links = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                text = a.get_text(strip=True)
-                if not href:
-                    continue
-                if self._should_skip(href, text):
-                    continue
-                links.append(urljoin(VCAA_BASE, href))
 
-            total = len(links)
+            for source in self.subject_urls:
+                if isinstance(source, dict):
+                    page_url = source.get("url")
+                    source_is_nht = bool(source.get("is_nht"))
+                    source_title = source.get("title")
+                else:
+                    page_url = source
+                    source_is_nht = False
+                    source_title = None
+                if not page_url:
+                    continue
+
+                parsed = urlparse(page_url)
+                path_lower = (parsed.path or "").lower()
+                if path_lower.endswith((".pdf", ".doc", ".docx")):
+                    links.append(
+                        {
+                            "url": page_url,
+                            "is_nht": source_is_nht
+                            or "nht" in path_lower
+                            or "northern-hemisphere" in path_lower
+                            or "northernhemisphere" in path_lower,
+                            "title": source_title,
+                        }
+                    )
+                    continue
+
+                resp = requests.get(
+                    page_url, headers=headers, timeout=30, verify=False
+                )
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    text = a.get_text(strip=True)
+                    if not href:
+                        continue
+                    if self._should_skip(href, text):
+                        continue
+                    file_url = urljoin(VCAA_BASE, href)
+                    combined_lower = href.lower()
+                    text_lower = (text or "").lower()
+                    links.append(
+                        {
+                            "url": file_url,
+                            "is_nht": source_is_nht
+                            or "nht" in combined_lower
+                            or "northern hemisphere" in text_lower
+                            or "northern-hemisphere" in combined_lower
+                            or "northernhemisphere" in combined_lower,
+                            "title": text,
+                        }
+                    )
+
+            # Preserve ordering while removing duplicates
+            seen = {}
+            unique_links = []
+            for link in links:
+                url = link.get("url") if isinstance(link, dict) else link
+                if not url:
+                    continue
+                is_nht = bool(link.get("is_nht")) if isinstance(link, dict) else False
+                title = link.get("title") if isinstance(link, dict) else None
+                if url in seen:
+                    if is_nht:
+                        seen[url]["is_nht"] = True
+                    if title and not seen[url].get("title"):
+                        seen[url]["title"] = title
+                    continue
+                stored = {"url": url, "is_nht": is_nht}
+                if title:
+                    stored["title"] = title
+                seen[url] = stored
+                unique_links.append(stored)
+
+            total = len(unique_links)
             if total == 0:
                 self.finished.emit(
                     f"No examination reports found for {self.subject_name}."
@@ -329,12 +709,19 @@ class VCAADownloadThread(QThread):
             completed = 0
             lock = threading.Lock()
 
-            def download_one(file_url):
+            def download_one(link_info):
                 nonlocal completed
+                file_url = link_info.get("url") if isinstance(link_info, dict) else link_info
+                is_nht_doc = bool(link_info.get("is_nht")) if isinstance(link_info, dict) else False
+                title_hint = link_info.get("title") if isinstance(link_info, dict) else None
+                if title_hint:
+                    lower_title = title_hint.lower()
+                    if "nht" in lower_title or "northern hemisphere" in lower_title:
+                        is_nht_doc = True
                 filename = file_url.split("/")[-1]
                 try:
                     r = requests.get(
-                        file_url, headers=headers, timeout=120
+                        file_url, headers=headers, timeout=120, verify=False
                     )
                     r.raise_for_status()
 
@@ -342,13 +729,15 @@ class VCAADownloadThread(QThread):
                     with open(temp_path, "wb") as f:
                         f.write(r.content)
 
-                    _, year, exam_number = parse_filename(temp_path)
+                    _, year, exam_number = parse_filename(temp_path, title_hint=title_hint)
                     ext = temp_path.suffix.lower()
                     parts = [self._clean_filename(self.subject_name)]
                     if year and year != "Unknown":
                         parts.append(year)
                     if exam_number and exam_number != "Unknown":
                         parts.append(exam_number)
+                    if is_nht_doc or "nht" in filename.lower():
+                        parts.append("NHT")
                     final_stem = "_".join(parts) if parts else temp_path.stem
                     final_path = subject_folder / f"{final_stem}{ext}"
 
@@ -371,7 +760,7 @@ class VCAADownloadThread(QThread):
             self.progress.emit("Starting concurrent downloads...", 0, total)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(download_one, url) for url in links]
+                futures = [executor.submit(download_one, link) for link in unique_links]
                 concurrent.futures.wait(futures)
 
             self.finished.emit(f"All reports for {self.subject_name} downloaded.")
@@ -426,9 +815,11 @@ class NoZoomPdfView(QPdfView):
         super().__init__(parent)
 
     def wheelEvent(self, event: QWheelEvent):
-        # Allow vertical scrolling, ignore for zooming
-        if event.angleDelta().y() != 0:
-            super().wheelEvent(event)  # Process scrolling
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            event.ignore()
+            return
+        if not event.pixelDelta().isNull() or event.angleDelta().y() != 0:
+            super().wheelEvent(event)
         else:
             event.ignore()
 
@@ -487,9 +878,14 @@ class VCEViewer(QMainWindow):
         self.pdf_view = NoZoomPdfView(self)
         self.pdf_view.setDocument(self.pdf_doc)
         self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.pdf_view.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.pdf_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-        self.current_zoom = 1.0
-        self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
+        self.current_zoom = self.pdf_view.zoomFactor()
 
         # Zoom buttons
         self.zoom_in_btn = QPushButton("+")
@@ -534,13 +930,21 @@ class VCEViewer(QMainWindow):
 
         self.load_files()
 
+    @staticmethod
+    def _is_nht_path(path: Path) -> bool:
+        stem = path.stem.lower()
+        normalized = stem.replace("_", " ").replace("-", " ")
+        return "nht" in stem or "northern hemisphere" in normalized
+
     def zoom_in(self):
         """Increase the zoom factor by 10%."""
+        self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
         self.current_zoom = min(self.current_zoom * 1.1, 4.0)
         self.pdf_view.setZoomFactor(self.current_zoom)
 
     def zoom_out(self):
         """Decrease the zoom factor by 10%."""
+        self.pdf_view.setZoomMode(QPdfView.ZoomMode.Custom)
         self.current_zoom = max(self.current_zoom / 1.1, 0.25)
         self.pdf_view.setZoomFactor(self.current_zoom)
 
@@ -587,6 +991,7 @@ class VCEViewer(QMainWindow):
                     "exam_number": exam_number,
                     "pdf_path": pdf_path,
                     "progress": prog,
+                    "is_nht": self._is_nht_path(file),
                 }
                 self.files.append(entry)
                 subjects.add(subject)
@@ -660,9 +1065,28 @@ class VCEViewer(QMainWindow):
                 self.file_list.addItem(header_item)
                 current_subject = subj
 
-            label_text = (
-                f"{entry['subject']}_{entry['year']}_{entry['exam_number']}.pdf"
-            )
+            exam_number = entry.get("exam_number", "Unknown") or "Unknown"
+            exam_display = ""
+            if exam_number != "Unknown":
+                lower_exam = exam_number.lower()
+                if lower_exam.startswith("exam"):
+                    suffix = exam_number[4:].strip()
+                    exam_display = f"Exam {suffix}" if suffix else "Exam"
+                else:
+                    exam_display = exam_number.title()
+            if entry.get("is_nht"):
+                exam_display = (
+                    f"{exam_display} (NHT)" if exam_display else "NHT Report"
+                )
+
+            label_parts = [entry["subject"]]
+            if year != "Unknown":
+                label_parts.append(year)
+            if exam_display:
+                label_parts.append(exam_display)
+            else:
+                label_parts.append("Report")
+            label_text = " - ".join(label_parts)
 
             row_widget = QWidget()
             vbox = QVBoxLayout(row_widget)
@@ -671,6 +1095,10 @@ class VCEViewer(QMainWindow):
             lbl = QLabel(label_text)
             lbl.setStyleSheet("font-weight: 500;")
             vbox.addWidget(lbl)
+
+            details = QLabel(entry["path"].name)
+            details.setStyleSheet("color: #666; font-size: 11px;")
+            vbox.addWidget(details)
 
             show_bar = (entry["path"].suffix.lower() in WORD_EXTENSIONS) and (
                     entry["pdf_path"] is None
@@ -720,7 +1148,8 @@ class VCEViewer(QMainWindow):
             self.temp_pdf_path = None
             self.pdf_doc.load(str(entry["pdf_path"]))
             self.current_pdf_path = str(entry["pdf_path"])
-            self.pdf_view.setZoomFactor(self.current_zoom)
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            self.current_zoom = self.pdf_view.zoomFactor()
         else:
             QMessageBox.information(
                 self, "Not ready", "This item isn't a PDF yet (conversion pending)."
@@ -962,9 +1391,10 @@ class VCEViewer(QMainWindow):
 
         def on_subjects_loaded(subjects: dict):
             combo.clear()
-            for s in sorted(subjects.keys()):
-                combo.addItem(s, subjects[s])
-            progress_label.setText(f"Loaded {len(subjects)} subjects from VCAA")
+            sorted_subjects = sorted(subjects.values(), key=lambda v: v["label"].lower())
+            for info in sorted_subjects:
+                combo.addItem(info["label"], info["urls"])
+            progress_label.setText(f"Loaded {len(sorted_subjects)} subjects from VCAA")
 
         def on_subject_error(msg):
             QMessageBox.warning(dialog, "Error", msg)
@@ -977,11 +1407,11 @@ class VCEViewer(QMainWindow):
 
         def download_selected():
             subject_name = combo.currentText()
-            subject_url = combo.currentData()
-            if not subject_url:
-                QMessageBox.warning(dialog, "Error", "No subject URL found.")
+            subject_urls = combo.currentData()
+            if not subject_urls:
+                QMessageBox.warning(dialog, "Error", "No subject URLs found.")
                 return
-            download_thread = VCAADownloadThread(subject_name, subject_url)
+            download_thread = VCAADownloadThread(subject_name, subject_urls)
 
             def update_progress(msg, current, total):
                 progress_bar.setMaximum(total)
