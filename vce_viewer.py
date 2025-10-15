@@ -95,6 +95,8 @@ SUBJECT_ALIASES = {
     "mathmethodscas": "MathMethodsCAS",
     "mathematicalmethods": "MathMethods",
     "mathmethods": "MathMethods",
+    "mathsmethods": "MathMethods",
+    "mathsmethod": "MathMethods",
     "methods": "MathMethods",
     "method": "MathMethods",
     "mmcas": "MathMethodsCAS",
@@ -103,6 +105,9 @@ SUBJECT_ALIASES = {
     "mmcas2": "MathMethodsCAS",
     "specialist": "SpecialistMaths",
     "sm": "SpecialistMaths",
+    "furthermathematics": "FurtherMathematics",
+    "furthermaths": "FurtherMathematics",
+    "fmaths": "FurtherMathematics",
     "chemistry": "Chemistry",
     "chem": "Chemistry",
 }
@@ -111,6 +116,8 @@ SUBJECT_KEY_ALIASES = {
     "mathmethodscas": "mathmethodscas",
     "mathematicalmethods": "mathmethods",
     "mathmethods": "mathmethods",
+    "mathsmethods": "mathmethods",
+    "mathsmethod": "mathmethods",
     "methods": "mathmethods",
     "method": "mathmethods",
     "mmcas": "mathmethodscas",
@@ -121,6 +128,9 @@ SUBJECT_KEY_ALIASES = {
     "specialistmathematics": "specialistmaths",
     "specialistmaths": "specialistmaths",
     "sm": "specialistmaths",
+    "furthermathematics": "furthermathematics",
+    "furthermaths": "furthermathematics",
+    "fmaths": "furthermathematics",
     "chemistry": "chemistry",
     "chem": "chemistry",
 }
@@ -129,6 +139,7 @@ SUBJECT_DISPLAY_NAMES = {
     "mathmethods": "Mathematical Methods",
     "mathmethodscas": "Mathematical Methods (CAS)",
     "specialistmaths": "Specialist Mathematics",
+    "furthermathematics": "Further Mathematics",
     "chemistry": "Chemistry",
 }
 
@@ -306,7 +317,7 @@ class DocxConverterThread(QThread):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
-                shell=(os.name == "nt"),  # Shell only for Windows
+                shell=False,
             )
 
             pdf_path = Path(self.output_dir) / (Path(self.docx_path).stem + ".pdf")
@@ -330,6 +341,7 @@ class VCAASubjectScraperThread(QThread):
     @staticmethod
     def _normalise_subject_key(label: str) -> str:
         cleaned = re.sub(r"\(.*?nht.*?\)", "", label or "", flags=re.IGNORECASE)
+        cleaned = re.sub(r"\(.*?\)", " ", cleaned)
         cleaned = re.sub(
             r"northern\s+hemisphere\s+timetable",
             " ",
@@ -344,6 +356,13 @@ class VCAASubjectScraperThread(QThread):
             cleaned,
             flags=re.IGNORECASE,
         )
+        cleaned = re.sub(
+            r"(examination|exam|report|assessment|paper)s?\s*\d+",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\b\d+\b", " ", cleaned)
         cleaned = re.sub(r"\b20\d{2}\b", " ", cleaned)
         cleaned = re.sub(r"[^A-Za-z0-9\s]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -372,6 +391,13 @@ class VCAASubjectScraperThread(QThread):
             spaced,
             flags=re.IGNORECASE,
         )
+        spaced = re.sub(
+            r"(examination|exam|report|assessment|paper)s?\s*\d+",
+            " ",
+            spaced,
+            flags=re.IGNORECASE,
+        )
+        spaced = re.sub(r"\b\d+\b", " ", spaced)
         spaced = re.sub(r"\b20\d{2}\b", " ", spaced)
         spaced = re.sub(r"[^A-Za-z0-9\s]+", " ", spaced)
         spaced = re.sub(r"\s+", " ", spaced).strip()
@@ -501,8 +527,6 @@ class VCAASubjectScraperThread(QThread):
                 continue
             text_lower = (text or "").lower()
             href_lower = href.lower()
-            if "nht" not in text_lower and "northern hemisphere" not in text_lower and "nht" not in href_lower:
-                continue
             if REPORT_TOKEN not in text_lower and REPORT_TOKEN not in href_lower:
                 continue
             full = urljoin(VCAA_BASE, href)
